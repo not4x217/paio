@@ -13,19 +13,22 @@ use anyhow::Error;
 use avail_rust::{avail, AvailExtrinsicParamsBuilder, Data, Keypair, SecretUri, WaitFor, SDK};
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{response, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use celestia_rpc::BlobClient;
 use celestia_types::{nmt::Namespace, Blob, TxConfig};
 use es_version::SequencerVersion;
+use futures_util::TryFutureExt;
 use message::{
     AppNonces, BatchBuilder, EspressoTransaction, SignedTransaction, SigningMessage,
     SubmitPointTransaction, WalletState, DOMAIN,
 };
 use serde::{Deserialize, Serialize};
-use std::fs;
+use tower::ServiceExt;
+use tracing_subscriber::fmt::format::json;
+use std::{fs, sync::atomic::{AtomicU64, Ordering}};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -151,6 +154,33 @@ sol!(
     }
   }
 );
+
+// !!!
+use alloy_core::sol_types::SolValue;
+use alloy_signer::SignerSync;
+use axum::{
+        body::Body,
+        http::{self, Request},
+};
+use message::WireTransaction;
+// use mime;
+use serde_json::json;
+use std::sync::atomic::AtomicU16;
+fn make_request(is_post: bool, uri: &str, body: Body) -> reqwest::Request {
+    let r = Request::builder()
+        .uri(uri)
+        .method(if is_post {
+            http::Method::POST
+        } else {
+            http::Method::GET
+        })
+        .header(http::header::CONTENT_TYPE, mime::APPLICATION_JSON.as_ref())
+        .body(body)
+        .unwrap();
+
+    let req = r.map(|body| reqwest::Body::wrap_stream(body.into_data_stream()));
+    reqwest::Request::try_from(req).expect("http::Uri to url::Url conversion failed")
+}
 
 #[derive(Deserialize, PartialEq)]
 #[allow(clippy::upper_case_acronyms)]
@@ -344,12 +374,13 @@ fn mock_state() -> WalletState {
 
 #[tokio::main]
 async fn main() {
-    let config_string = fs::read_to_string("config_default.toml").unwrap();
+    let config_string = fs::read_to_string("config.toml").unwrap();
     let mut config: Config = toml::from_str(&config_string).unwrap();
 
     // Create a provider with the HTTP transport using the `reqwest` crate.
+    let anvil;
     let (provider, signer) = if config.use_local_anvil {
-        let anvil = Anvil::new().try_spawn().expect("Anvil not working");
+        anvil = Anvil::new().try_spawn().expect("Anvil not working");
         let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
         let rpc_url: String = anvil.endpoint().parse().expect("Could not get Anvil's url");
         config.base_url = rpc_url.clone();
@@ -445,6 +476,93 @@ async fn main() {
         .route("/health", get(health))
         .with_state(shared_state)
         .layer(cors);
+    
+
+    // !!!
+    let global_nonce = Arc::new(AtomicU64::new(0));
+    let signer = PrivateKeySigner::random();
+    let signer_address = signer.address();
+
+    // !!!
+    // Query nonces
+    let nonce_query = global_nonce.clone();
+    task::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let client = reqwest::Client::new();
+
+        loop {
+            println!("querying nonces");
+            
+            let nonce_id = NonceIdentifier {
+                application: address!("0000000000000000000000000000000000000000"),
+                user: signer_address,
+            };
+            let req = make_request(
+                true,
+                "http://localhost:3000/nonce",
+                Body::from(serde_json::to_vec(&json!(nonce_id)).unwrap()),
+            );
+            let resp_text = client.execute(req).await.unwrap().text().await.unwrap();
+            let resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
+            let nonce = resp.as_object().unwrap().get("nonce").unwrap().as_u64().unwrap();
+
+            println!("nonce from api is {}", nonce);
+
+            nonce_query.store(nonce, Ordering::Relaxed);
+        }
+    });
+
+    // !!!
+    // Submit transactions
+    let nonce_submit = global_nonce.clone();
+    task::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;     
+        
+        let client = reqwest::Client::new();
+        let gas = 2000000000;
+
+        loop {   
+            let nonce = nonce_submit.load(Ordering::Relaxed);
+
+            println!("nonce to submit is {}", nonce);
+            
+            let json = format!(
+                r#"
+            {{
+                "app":"0x0000000000000000000000000000000000000000",
+                "nonce":{nonce},
+                "max_gas_price":{gas},
+                "data":"0x48656c6c6f2c20576f726c6421"
+            }}
+            "#
+            );
+            let v: SigningMessage = serde_json::from_str(&json).unwrap();
+            let signature = signer.sign_typed_data_sync(&v, &DOMAIN).unwrap();
+            let signed_transaction = SignedTransaction {
+                message: v,
+                signature,
+            };
+            let tx = WireTransaction::from_signed_transaction(&signed_transaction).to_signed_transaction();
+
+            println!("submitting new transaction");
+
+            let transaction = SubmitPointTransaction {
+                message: alloy_core::primitives::hex::encode(tx.message.abi_encode_params()),
+                signature: alloy_core::primitives::hex::encode(tx.signature.as_bytes()),
+            };
+            let req = make_request(
+                true,
+                "http://localhost:3000/transaction",
+                Body::from(serde_json::to_vec(&json!(transaction)).unwrap()),
+            );
+            let resp = client.execute(req).await.unwrap();
+            
+            println!("submitting new transaction finished");
+
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(":::3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -517,7 +635,7 @@ async fn submit_transaction(
     Json(submitted_transaction): Json<SubmitPointTransaction>,
 ) -> Result<(StatusCode, ()), (StatusCode, String)> {
     let sig = alloy_signer::Signature::from_str(&submitted_transaction.signature);
-    let message = SigningMessage::abi_decode_params(
+    let message = <SigningMessage as SolType>::abi_decode_params(
         &alloy_core::primitives::hex::decode(&submitted_transaction.message).unwrap(),
         true,
     );
@@ -561,6 +679,7 @@ async fn submit_transaction(
             ));
         }
     }
+  
     let mut state_lock = state.lock().await;
     let sequencer_address = state_lock.config.sequencer_address;
     let transaction_opt = state_lock
@@ -767,6 +886,10 @@ mod tests {
             message: alloy_core::primitives::hex::encode(transaction.message.abi_encode_params()),
             signature: alloy_core::primitives::hex::encode(transaction.signature.as_bytes()),
         };
+
+        let strr = serde_json::to_string(&json!(transaction)).unwrap();
+        println!("{:}", strr);
+        
         let response = app
             .oneshot(make_request(
                 true,
