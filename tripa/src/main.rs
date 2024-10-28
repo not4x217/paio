@@ -165,7 +165,6 @@ use axum::{
 use message::WireTransaction;
 // use mime;
 use serde_json::json;
-use std::sync::atomic::AtomicU16;
 fn make_request(is_post: bool, uri: &str, body: Body) -> reqwest::Request {
     let r = Request::builder()
         .uri(uri)
@@ -612,15 +611,19 @@ struct Nonce {
 async fn gas_price(
     State(state): State<Arc<LambdaMutex>>,
 ) -> Result<(StatusCode, Json<u128>), (StatusCode, String)> {
-    match get_gas_price(state).await {
+    let lambda = state.lock().await;
+    match lambda.provider.get_gas_price().await {
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         Ok(gas) => Ok((StatusCode::OK, Json(gas))),
     }
 }
 
+// !!!
+/*
 async fn get_gas_price(state: Arc<LambdaMutex>) -> Result<u128, Error> {
     Ok(state.lock().await.provider.get_gas_price().await?)
 }
+*/
 
 async fn get_domain(State(_state): State<Arc<LambdaMutex>>) -> (StatusCode, Json<Eip712Domain>) {
     (StatusCode::OK, Json(DOMAIN))
@@ -663,8 +666,9 @@ async fn submit_transaction(
     // TODO: add logic to calculate wei per byte, now it is wei per gas
     // TODO: send the gas logic to the specific DA backend
     // TODO: check gas prices on other DA's
-    if state.lock().await.config.da_layer == DALayer::EVM {
-        let gas_price = match get_gas_price(state.clone()).await {
+    let mut lambda = state.lock().await;
+    if lambda.config.da_layer == DALayer::EVM {
+        let gas_price = match lambda.provider.get_gas_price().await {
             Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
             Ok(g) => g,
         };
@@ -680,9 +684,8 @@ async fn submit_transaction(
         }
     }
   
-    let mut state_lock = state.lock().await;
-    let sequencer_address = state_lock.config.sequencer_address;
-    let transaction_opt = state_lock
+    let sequencer_address = lambda.config.sequencer_address;
+    let transaction_opt = lambda
         .wallet_state
         .verify_single(sequencer_address, &signed_transaction.to_wire_transaction());
     if transaction_opt.is_none() {
@@ -692,7 +695,7 @@ async fn submit_transaction(
             "Transaction not valid".to_string(),
         ));
     };
-    state_lock.batch_builder.add(signed_transaction.clone());
+    lambda.batch_builder.add(signed_transaction.clone());
     Ok((StatusCode::CREATED, ()))
 }
 
