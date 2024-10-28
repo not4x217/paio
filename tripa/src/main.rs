@@ -8,7 +8,7 @@ use alloy_node_bindings::Anvil;
 use alloy_node_bindings::AnvilInstance;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
-use alloy_signer_local::PrivateKeySigner;
+use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use anyhow::Error;
 use avail_rust::{avail, AvailExtrinsicParamsBuilder, Data, Keypair, SecretUri, WaitFor, SDK};
 use axum::{
@@ -157,7 +157,7 @@ sol!(
 
 // !!!
 use alloy_core::sol_types::SolValue;
-use alloy_signer::SignerSync;
+use alloy_signer::{k256::{ecdsa::SigningKey, Secp256k1}, SignerSync};
 use axum::{
         body::Body,
         http::{self, Request},
@@ -179,6 +179,56 @@ fn make_request(is_post: bool, uri: &str, body: Body) -> reqwest::Request {
 
     let req = r.map(|body| reqwest::Body::wrap_stream(body.into_data_stream()));
     reqwest::Request::try_from(req).expect("http::Uri to url::Url conversion failed")
+}
+async fn query_nonce(app_address: Address, signer_address: Address) -> u64 {
+    let nonce_id = NonceIdentifier {
+        application: app_address,
+        user: signer_address,
+    };
+    let req = make_request(
+        true,
+        "http://localhost:3000/nonce",
+        Body::from(serde_json::to_vec(&json!(nonce_id)).unwrap()),
+    );
+    let client = reqwest::Client::new();
+    let resp_text = client.execute(req).await.unwrap().text().await.unwrap();
+    let resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
+    resp.as_object().unwrap().get("nonce").unwrap().as_u64().unwrap()
+}
+async fn submit_txn(signer: Arc<LocalSigner<SigningKey>>, nonce: u64) -> bool {
+    let json = format!(
+        r#"
+    {{
+        "app":"0x0000000000000000000000000000000000000000",
+        "nonce":{nonce},
+        "max_gas_price":2000000000,
+        "data":"0x48656c6c6f2c20576f726c6421"
+    }}
+    "#
+    );
+    let v: SigningMessage = serde_json::from_str(&json).unwrap();
+    let signature = signer.sign_typed_data_sync(&v, &DOMAIN).unwrap();
+    let signed_transaction = SignedTransaction {
+        message: v,
+        signature,
+    };
+    let tx = WireTransaction::from_signed_transaction(&signed_transaction).to_signed_transaction();
+
+    println!("submitting new transaction");
+
+    let transaction = SubmitPointTransaction {
+        message: alloy_core::primitives::hex::encode(tx.message.abi_encode_params()),
+        signature: alloy_core::primitives::hex::encode(tx.signature.as_bytes()),
+    };
+    let req = make_request(
+        true,
+        "http://localhost:3000/transaction",
+        Body::from(serde_json::to_vec(&json!(transaction)).unwrap()),
+    );
+    let client = reqwest::Client::new();
+    let resp = client.execute(req).await.unwrap();
+
+    resp.status() == StatusCode::CREATED
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -478,88 +528,42 @@ async fn main() {
     
 
     // !!!
-    let global_nonce = Arc::new(AtomicU64::new(0));
-    let signer = PrivateKeySigner::random();
+    let app_address = address!("0000000000000000000000000000000000000000");
+    let signer = Arc::new(PrivateKeySigner::random());
     let signer_address = signer.address();
-
-    // !!!
-    // Query nonces
-    let nonce_query = global_nonce.clone();
+    let global_lock = Arc::new(Mutex::new(true));
+    // Thread 1
+    let signer_1 = signer.clone();
+    let lock_1 = global_lock.clone();
     task::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-        let client = reqwest::Client::new();
-
         loop {
-            println!("querying nonces");
-            
-            let nonce_id = NonceIdentifier {
-                application: address!("0000000000000000000000000000000000000000"),
-                user: signer_address,
-            };
-            let req = make_request(
-                true,
-                "http://localhost:3000/nonce",
-                Body::from(serde_json::to_vec(&json!(nonce_id)).unwrap()),
-            );
-            let resp_text = client.execute(req).await.unwrap().text().await.unwrap();
-            let resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
-            let nonce = resp.as_object().unwrap().get("nonce").unwrap().as_u64().unwrap();
+            //let l = lock_1.lock().await;
 
-            println!("nonce from api is {}", nonce);
-
-            nonce_query.store(nonce, Ordering::Relaxed);
+            println!("thread 1 querying nonce...");
+            let nonce = query_nonce(app_address, signer_address).await;
+            println!("thread 1 got nonce - {}", nonce);
+        
+            println!("thread 1 submitting transaction...");
+            let result = submit_txn(signer_1.clone(), nonce).await;
+            println!("thread 1 submitted transaction, success - {}", result);
         }
     });
-
-    // !!!
-    // Submit transactions
-    let nonce_submit = global_nonce.clone();
+    // Thread 2
+    let signer_2 = signer.clone();
+    let lock_2 = global_lock.clone();
     task::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;     
-        
-        let client = reqwest::Client::new();
-        let gas = 2000000000;
-
         loop {   
-            let nonce = nonce_submit.load(Ordering::Relaxed);
-
-            println!("nonce to submit is {}", nonce);
+            //let l = lock_2.lock().await;
             
-            let json = format!(
-                r#"
-            {{
-                "app":"0x0000000000000000000000000000000000000000",
-                "nonce":{nonce},
-                "max_gas_price":{gas},
-                "data":"0x48656c6c6f2c20576f726c6421"
-            }}
-            "#
-            );
-            let v: SigningMessage = serde_json::from_str(&json).unwrap();
-            let signature = signer.sign_typed_data_sync(&v, &DOMAIN).unwrap();
-            let signed_transaction = SignedTransaction {
-                message: v,
-                signature,
-            };
-            let tx = WireTransaction::from_signed_transaction(&signed_transaction).to_signed_transaction();
-
-            println!("submitting new transaction");
-
-            let transaction = SubmitPointTransaction {
-                message: alloy_core::primitives::hex::encode(tx.message.abi_encode_params()),
-                signature: alloy_core::primitives::hex::encode(tx.signature.as_bytes()),
-            };
-            let req = make_request(
-                true,
-                "http://localhost:3000/transaction",
-                Body::from(serde_json::to_vec(&json!(transaction)).unwrap()),
-            );
-            let resp = client.execute(req).await.unwrap();
-            
-            println!("submitting new transaction finished");
-
-            assert_eq!(resp.status(), StatusCode::CREATED);
+            println!("thread 2 querying nonce...");
+            let nonce = query_nonce(app_address, signer_address).await;
+            println!("thread 2 got nonce - {}", nonce);
+        
+            println!("thread 2 submitting transaction...");
+            let result = submit_txn(signer_2.clone(), nonce).await;
+            println!("thread 2 submitted transaction, success - {}", result);
         }
     });
 
