@@ -1,3 +1,26 @@
+use std::{
+    fs,
+    str::FromStr,
+    sync::Arc,
+};
+
+use log::{info, error};
+use anyhow::Error;
+use serde::{Deserialize, Serialize};
+use es_version::SequencerVersion;
+
+use tokio::{
+    task,
+    sync::Mutex,
+};
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+
 use alloy_core::{
     primitives::{address, Address, Bytes, U256},
     sol,
@@ -9,27 +32,16 @@ use alloy_node_bindings::AnvilInstance;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use anyhow::Error;
+
 use avail_rust::{avail, AvailExtrinsicParamsBuilder, Data, Keypair, SecretUri, WaitFor, SDK};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::{get, post},
-    Json, Router,
-};
+
 use celestia_rpc::BlobClient;
 use celestia_types::{nmt::Namespace, Blob, TxConfig};
-use es_version::SequencerVersion;
+
 use message::{
     AppNonces, BatchBuilder, EspressoTransaction, SignedTransaction, SigningMessage,
     SubmitPointTransaction, WalletState, DOMAIN,
 };
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::str::FromStr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::task;
 
 async fn fund_sequencer(
     signer_address: Address,
