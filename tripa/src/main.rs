@@ -5,7 +5,7 @@ use std::{
 };
 
 use log::{info, error};
-use anyhow::Error;
+use anyhow::{Error, anyhow};
 use serde::{Deserialize, Serialize};
 use es_version::SequencerVersion;
 
@@ -222,10 +222,11 @@ impl Lambda {
                 let batch = self.batch_builder.clone().build();
                 self.batch_builder = BatchBuilder::new(self.config.sequencer_address);
 
+                let provider_url = self.config.base_url.parse().expect("failed to parse eth rpc url"); 
                 let provider = ProviderBuilder::new()
                     .with_recommended_fillers()
                     .wallet(EthereumWallet::from(signer.clone()))
-                    .on_http(self.config.base_url.parse().unwrap());
+                    .on_http(provider_url);
                 // TODO: try to use the lambda's provider instead, but it seems that
                 //       it cannot be cloned. or something
                 //         let provider = self.provider.clone();
@@ -243,7 +244,7 @@ impl Lambda {
                 let event = input_contract.InputAdded_filter();
                 let _ = tx.send().await?.get_receipt().await?;
                 // now go listen to the events
-                let log = event.query().await.unwrap();
+                let log = event.query().await?;
                 let event = &log[0].0;
 
                 // testing if the batch is contained in the logs
@@ -272,41 +273,41 @@ impl Lambda {
                 let client =
                     celestia_rpc::Client::new(&self.config.base_url, Some(&self.config.auth_token))
                         .await
-                        .expect("Failed creating rpc client");
+                        .expect("failed to create celestia rpc client");
+                let namespace_id = hex::decode(self.config.namespace.clone())
+                    .expect("failed to parse celestia namesapce id");
+                let namespace = Namespace::new_v0(&namespace_id)
+                    .expect("invalid celestia namespace");
 
-                let data = tx.clone();
-                let blob = Blob::new(
-                    Namespace::new_v0(&hex::decode(self.config.namespace.clone()).unwrap())
-                        .expect("Invalid namespace"),
-                    data,
-                )
-                .unwrap();
-
+                let blob = Blob::new(namespace, tx.clone())?;
                 client
                     .blob_submit(&[blob], TxConfig::default())
-                    .await
-                    .unwrap();
+                    .await?;
             }
             DALayer::Espresso => {
-                let txn = EspressoTransaction::new((self.config.vm_id as u64).into(), tx.clone());
-
+                let url = self.config.base_url.parse().expect("failed to parse espresso api url");
                 let client: surf_disco::Client<tide_disco::error::ServerError, SequencerVersion> =
-                    surf_disco::Client::new(self.config.base_url.parse().unwrap());
+                    surf_disco::Client::new(url);
+                
+                let txn = EspressoTransaction::new((self.config.vm_id as u64).into(), tx.clone());
                 client
                     .post::<()>("v0/submit/submit")
                     .body_json(&txn)
-                    .unwrap()
+                    .expect("invalid espresso request json body")
                     .send()
-                    .await
-                    .unwrap();
+                    .await?;
             }
             DALayer::Avail => {
-                let client = SDK::new(&self.config.base_url).await.unwrap();
-                let secret_uri = SecretUri::from_str(&self.config.seed).unwrap();
-                let account = Keypair::from_uri(&secret_uri).unwrap();
+                let secret_uri = SecretUri::from_str(&self.config.seed)
+                    .expect("invalid avail secret uri");
+                let account = Keypair::from_uri(&secret_uri)
+                    .expect("invalid avail account");
                 let account_id = account.public_key().to_account_id();
 
-                let nonce = client.api.tx().account_nonce(&account_id).await.unwrap();
+                let client = SDK::new(&self.config.base_url).await.
+                    expect("failed to create avail client");
+                
+                let nonce = client.api.tx().account_nonce(&account_id).await?;
                 let data = Data { 0: tx.to_vec() };
 
                 let call = avail::tx().data_availability().submit_data(data);
@@ -321,11 +322,12 @@ impl Lambda {
                     .sign_and_submit_then_watch(&call, &account, params)
                     .await;
 
-                client
+                if let Err(msg) = client
                     .util
                     .progress_transaction(maybe_tx_progress, WaitFor::BlockInclusion)
-                    .await
-                    .unwrap();
+                    .await {
+                    return Err(anyhow!(msg))
+                }
             }
         }
         Ok(())
@@ -431,7 +433,9 @@ async fn main() {
             // TODO: investigate why there are no transactions when the batch is empty
             let mut state = state_copy_for_batches.lock().await;
             if !state.batch_builder.txs.is_empty() {
-                state.build_batch().await.unwrap();
+                if let Err(err) = state.build_batch().await {
+                    error!("failed to build batch - {err}")
+                }
             } else {
                 println!("Skipping batch, no transactions");
             }
