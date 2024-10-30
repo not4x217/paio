@@ -360,12 +360,13 @@ fn mock_state() -> WalletState {
 
 #[tokio::main]
 async fn main() {
-    let config_string = fs::read_to_string("config_default.toml").expect("failed to read config");
+    let config_string = fs::read_to_string("config.toml").expect("failed to read config");
     let mut config: Config = toml::from_str(&config_string).expect("failed to parse config");
 
     // Create a provider with the HTTP transport using the `reqwest` crate.
+    let anvil: AnvilInstance;
     let (provider, signer) = if config.use_local_anvil {
-        let anvil = Anvil::new().try_spawn().expect("failed to start anvil");
+        anvil = Anvil::new().try_spawn().expect("failed to start anvil");
         let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
         let rpc_url: String = anvil.endpoint().parse().expect("failed to get anvil url");
         config.base_url = rpc_url.clone();
