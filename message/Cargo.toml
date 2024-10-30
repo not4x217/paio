@@ -6,6 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+tracing = "0.1.40"
+
 alloy-core = { version = "0.8.5", features = ["sol-types", "serde"] }
 alloy-signer = { version = "0.3.6", features = ["eip712"] }
 

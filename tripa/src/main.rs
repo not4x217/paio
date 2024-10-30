@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use log::{info, error};
 use anyhow::{Error, anyhow};
 use serde::{Deserialize, Serialize};
 use es_version::SequencerVersion;
@@ -13,6 +12,7 @@ use tokio::{
     task,
     sync::Mutex,
 };
+
 
 use axum::{
     extract::State,
@@ -269,7 +269,7 @@ impl Lambda {
                 // TODO: in production someone can break the above assertions
                 //       by submitting an input at the same time
 
-                println!("log {:?}", log);
+                tracing::info!("log {:?}", log);
             }
             DALayer::Celestia => {
                 let client =
@@ -425,30 +425,31 @@ async fn main() {
     });
 
     let shared_state = Arc::new(lambda);
-
     let state_copy_for_batches = shared_state.clone();
 
     // this thread will periodically try to build a batch
+    tracing_subscriber::fmt()
+    .with_target(false)
+    .compact()
+    .init();
+    
     task::spawn(async move {
         loop {
-            println!("Building batch...");
+            tracing::info!("Building batch...");
             // TODO: investigate why there are no transactions when the batch is empty
             let mut state = state_copy_for_batches.lock().await;
             if !state.batch_builder.txs.is_empty() {
                 if let Err(err) = state.build_batch().await {
-                    error!("failed to build batch - {err}")
+                    tracing::error!("failed to build batch - {err}")
                 }
             } else {
-                println!("Skipping batch, no transactions");
+                tracing::info!("Skipping batch, no transactions");
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
 
-    // initialize tracing
-    tracing_subscriber::fmt::init();
     let cors = tower_http::cors::CorsLayer::permissive();
-
     let app = Router::new()
         // `GET /nonce` gets user nonce (see nonce function)
         .route("/nonce", post(get_nonce))
@@ -479,7 +480,7 @@ async fn get_nonce(
     State(state): State<Arc<LambdaMutex>>,
     Json(payload): Json<NonceIdentifier>,
 ) -> (StatusCode, Json<Nonce>) {
-    println!(
+    tracing::info!(
         "Getting nonce from user {:?} to application {:?}",
         payload.user, payload.application
     );
@@ -544,14 +545,14 @@ async fn submit_transaction(
         true,
     );
 
-    println!("new transaction submitted: {:?} sig {:?}", message, sig);
+    tracing::info!("new transaction submitted: {:?} sig {:?}", message, sig);
     if let Err(e) = sig {
-        println!("declined tx: sig serialization failed");
+        tracing::error!("declined tx: sig serialization failed");
         return Err((StatusCode::EXPECTATION_FAILED, e.to_string()));
     }
 
     if let Err(e) = message {
-        println!("declined tx: message serialization failed");
+        tracing::error!("declined tx: message serialization failed");
         return Err((StatusCode::EXPECTATION_FAILED, e.to_string()));
     }
 
@@ -561,7 +562,7 @@ async fn submit_transaction(
     };
 
     if let Err(e) = signed_transaction.recover(&DOMAIN) {
-        println!("declined tx: sig recovery failed");
+        tracing::error!("declined tx: sig recovery failed");
         return Err((StatusCode::UNAUTHORIZED, e.to_string()));
     };
     // TODO: add logic to calculate wei per byte, now it is wei per gas
@@ -590,7 +591,7 @@ async fn submit_transaction(
         .wallet_state
         .verify_single(sequencer_address, &signed_transaction.to_wire_transaction());
     if transaction_opt.is_none() {
-        println!("declined tx: transaction not valid");
+        tracing::error!("declined tx: transaction not valid");
         return Err((
             StatusCode::NOT_ACCEPTABLE,
             "Transaction not valid".to_string(),
