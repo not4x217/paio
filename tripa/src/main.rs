@@ -53,9 +53,11 @@ async fn fund_sequencer(
         .to(sequencer_address)
         .value("30000000000000000000".parse().unwrap());
     // Send the transaction and wait for the broadcast.
-    let pending_tx = provider.send_transaction(tx).await.unwrap();
+    let pending_tx = provider.send_transaction(tx)
+        .await.expect("failed to send tranaction to fund sequencer");
     // Wait for the transaction to be included and get the receipt.
-    let _receipt = pending_tx.get_receipt().await.unwrap();
+    let _receipt = pending_tx.get_receipt()
+        .await.expect("failed to get transaction receipt");
 }
 
 // TODO: unify this code. the current problem is that provider does not have a size
@@ -358,21 +360,21 @@ fn mock_state() -> WalletState {
 
 #[tokio::main]
 async fn main() {
-    let config_string = fs::read_to_string("config_default.toml").unwrap();
-    let mut config: Config = toml::from_str(&config_string).unwrap();
+    let config_string = fs::read_to_string("config_default.toml").expect("failed to read config");
+    let mut config: Config = toml::from_str(&config_string).expect("failed to parse config");
 
     // Create a provider with the HTTP transport using the `reqwest` crate.
     let (provider, signer) = if config.use_local_anvil {
-        let anvil = Anvil::new().try_spawn().expect("Anvil not working");
+        let anvil = Anvil::new().try_spawn().expect("failed to start anvil");
         let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
-        let rpc_url: String = anvil.endpoint().parse().expect("Could not get Anvil's url");
+        let rpc_url: String = anvil.endpoint().parse().expect("failed to get anvil url");
         config.base_url = rpc_url.clone();
         (
             Box::new(
                 ProviderBuilder::new()
                     .with_recommended_fillers()
                     .wallet(EthereumWallet::from(signer.clone()))
-                    .on_http(config.base_url.parse().unwrap()),
+                    .on_http(config.base_url.parse().expect("failed to parse base url")),
             ),
             signer,
         )
@@ -380,13 +382,13 @@ async fn main() {
         let signer = config
             .sequencer_signer_string
             .parse::<alloy_signer_local::PrivateKeySigner>()
-            .expect("Could not parse sequencer signature");
+            .expect("failed to parse sequencer signature");
         (
             Box::new(
                 ProviderBuilder::new()
                     .with_recommended_fillers()
                     .wallet(EthereumWallet::from(signer.clone()))
-                    .on_http(config.base_url.parse().unwrap()),
+                    .on_http(config.base_url.parse().expect("failed to parse base url")),
             ),
             signer,
         )
@@ -403,13 +405,13 @@ async fn main() {
             let nonce = provider
                 .get_transaction_count(signer.address())
                 .await
-                .unwrap();
+                .expect("failed to get eth account nonce");
             config.input_box_address = InputBox::deploy_builder(provider.clone())
                 .nonce(nonce)
                 .from(signer.address())
                 .deploy()
                 .await
-                .unwrap()
+                .expect("failed to deploy eth smart contract")
         }
     }
 
@@ -462,7 +464,7 @@ async fn main() {
         .with_state(shared_state)
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind(":::3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(":::3000").await.expect("failed to start tokio tcp listener");
     axum::serve(listener, app).await.unwrap();
 }
 
