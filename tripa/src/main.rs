@@ -1,3 +1,26 @@
+use std::{
+    fs,
+    str::FromStr,
+    sync::Arc,
+};
+
+use anyhow::{Error, anyhow};
+use serde::{Deserialize, Serialize};
+use es_version::SequencerVersion;
+
+use tokio::{
+    task,
+    sync::Mutex,
+};
+
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+
 use alloy_core::{
     primitives::{address, Address, Bytes, U256},
     sol,
@@ -9,27 +32,16 @@ use alloy_node_bindings::AnvilInstance;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use anyhow::Error;
+
 use avail_rust::{avail, AvailExtrinsicParamsBuilder, Data, Keypair, SecretUri, WaitFor, SDK};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::{get, post},
-    Json, Router,
-};
+
 use celestia_rpc::BlobClient;
 use celestia_types::{nmt::Namespace, Blob, TxConfig};
-use es_version::SequencerVersion;
+
 use message::{
     AppNonces, BatchBuilder, EspressoTransaction, SignedTransaction, SigningMessage,
     SubmitPointTransaction, WalletState, DOMAIN,
 };
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::str::FromStr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::task;
 
 async fn fund_sequencer(
     signer_address: Address,
@@ -41,9 +53,11 @@ async fn fund_sequencer(
         .to(sequencer_address)
         .value("30000000000000000000".parse().unwrap());
     // Send the transaction and wait for the broadcast.
-    let pending_tx = provider.send_transaction(tx).await.unwrap();
+    let pending_tx = provider.send_transaction(tx)
+        .await.expect("failed to send tranaction to fund sequencer");
     // Wait for the transaction to be included and get the receipt.
-    let _receipt = pending_tx.get_receipt().await.unwrap();
+    let _receipt = pending_tx.get_receipt()
+        .await.expect("failed to get transaction receipt");
 }
 
 // TODO: unify this code. the current problem is that provider does not have a size
@@ -210,10 +224,11 @@ impl Lambda {
                 let batch = self.batch_builder.clone().build();
                 self.batch_builder = BatchBuilder::new(self.config.sequencer_address);
 
+                let provider_url = self.config.base_url.parse().expect("failed to parse eth rpc url"); 
                 let provider = ProviderBuilder::new()
                     .with_recommended_fillers()
                     .wallet(EthereumWallet::from(signer.clone()))
-                    .on_http(self.config.base_url.parse().unwrap());
+                    .on_http(provider_url);
                 // TODO: try to use the lambda's provider instead, but it seems that
                 //       it cannot be cloned. or something
                 //         let provider = self.provider.clone();
@@ -231,7 +246,7 @@ impl Lambda {
                 let event = input_contract.InputAdded_filter();
                 let _ = tx.send().await?.get_receipt().await?;
                 // now go listen to the events
-                let log = event.query().await.unwrap();
+                let log = event.query().await?;
                 let event = &log[0].0;
 
                 // testing if the batch is contained in the logs
@@ -254,47 +269,47 @@ impl Lambda {
                 // TODO: in production someone can break the above assertions
                 //       by submitting an input at the same time
 
-                println!("log {:?}", log);
+                tracing::info!("log {:?}", log);
             }
             DALayer::Celestia => {
                 let client =
                     celestia_rpc::Client::new(&self.config.base_url, Some(&self.config.auth_token))
                         .await
-                        .expect("Failed creating rpc client");
+                        .expect("failed to create celestia rpc client");
+                let namespace_id = hex::decode(self.config.namespace.clone())
+                    .expect("failed to parse celestia namesapce id");
+                let namespace = Namespace::new_v0(&namespace_id)
+                    .expect("invalid celestia namespace");
 
-                let data = tx.clone();
-                let blob = Blob::new(
-                    Namespace::new_v0(&hex::decode(self.config.namespace.clone()).unwrap())
-                        .expect("Invalid namespace"),
-                    data,
-                )
-                .unwrap();
-
+                let blob = Blob::new(namespace, tx.clone())?;
                 client
                     .blob_submit(&[blob], TxConfig::default())
-                    .await
-                    .unwrap();
+                    .await?;
             }
             DALayer::Espresso => {
-                let txn = EspressoTransaction::new((self.config.vm_id as u64).into(), tx.clone());
-
+                let url = self.config.base_url.parse().expect("failed to parse espresso api url");
                 let client: surf_disco::Client<tide_disco::error::ServerError, SequencerVersion> =
-                    surf_disco::Client::new(self.config.base_url.parse().unwrap());
+                    surf_disco::Client::new(url);
+                
+                let txn = EspressoTransaction::new((self.config.vm_id as u64).into(), tx.clone());
                 client
                     .post::<()>("v0/submit/submit")
                     .body_json(&txn)
-                    .unwrap()
+                    .expect("invalid espresso request json body")
                     .send()
-                    .await
-                    .unwrap();
+                    .await?;
             }
             DALayer::Avail => {
-                let client = SDK::new(&self.config.base_url).await.unwrap();
-                let secret_uri = SecretUri::from_str(&self.config.seed).unwrap();
-                let account = Keypair::from_uri(&secret_uri).unwrap();
+                let secret_uri = SecretUri::from_str(&self.config.seed)
+                    .expect("invalid avail secret uri");
+                let account = Keypair::from_uri(&secret_uri)
+                    .expect("invalid avail account");
                 let account_id = account.public_key().to_account_id();
 
-                let nonce = client.api.tx().account_nonce(&account_id).await.unwrap();
+                let client = SDK::new(&self.config.base_url).await.
+                    expect("failed to create avail client");
+                
+                let nonce = client.api.tx().account_nonce(&account_id).await?;
                 let data = Data { 0: tx.to_vec() };
 
                 let call = avail::tx().data_availability().submit_data(data);
@@ -309,11 +324,12 @@ impl Lambda {
                     .sign_and_submit_then_watch(&call, &account, params)
                     .await;
 
-                client
+                if let Err(msg) = client
                     .util
                     .progress_transaction(maybe_tx_progress, WaitFor::BlockInclusion)
-                    .await
-                    .unwrap();
+                    .await {
+                    return Err(anyhow!(msg))
+                }
             }
         }
         Ok(())
@@ -344,21 +360,22 @@ fn mock_state() -> WalletState {
 
 #[tokio::main]
 async fn main() {
-    let config_string = fs::read_to_string("config_default.toml").unwrap();
-    let mut config: Config = toml::from_str(&config_string).unwrap();
+    let config_string = fs::read_to_string("config.toml").expect("failed to read config");
+    let mut config: Config = toml::from_str(&config_string).expect("failed to parse config");
 
     // Create a provider with the HTTP transport using the `reqwest` crate.
+    let anvil: AnvilInstance;
     let (provider, signer) = if config.use_local_anvil {
-        let anvil = Anvil::new().try_spawn().expect("Anvil not working");
+        anvil = Anvil::new().try_spawn().expect("failed to start anvil");
         let signer: PrivateKeySigner = anvil.keys()[0].clone().into();
-        let rpc_url: String = anvil.endpoint().parse().expect("Could not get Anvil's url");
+        let rpc_url: String = anvil.endpoint().parse().expect("failed to get anvil url");
         config.base_url = rpc_url.clone();
         (
             Box::new(
                 ProviderBuilder::new()
                     .with_recommended_fillers()
                     .wallet(EthereumWallet::from(signer.clone()))
-                    .on_http(config.base_url.parse().unwrap()),
+                    .on_http(config.base_url.parse().expect("failed to parse base url")),
             ),
             signer,
         )
@@ -366,13 +383,13 @@ async fn main() {
         let signer = config
             .sequencer_signer_string
             .parse::<alloy_signer_local::PrivateKeySigner>()
-            .expect("Could not parse sequencer signature");
+            .expect("failed to parse sequencer signature");
         (
             Box::new(
                 ProviderBuilder::new()
                     .with_recommended_fillers()
                     .wallet(EthereumWallet::from(signer.clone()))
-                    .on_http(config.base_url.parse().unwrap()),
+                    .on_http(config.base_url.parse().expect("failed to parse base url")),
             ),
             signer,
         )
@@ -389,13 +406,13 @@ async fn main() {
             let nonce = provider
                 .get_transaction_count(signer.address())
                 .await
-                .unwrap();
+                .expect("failed to get eth account nonce");
             config.input_box_address = InputBox::deploy_builder(provider.clone())
                 .nonce(nonce)
                 .from(signer.address())
                 .deploy()
                 .await
-                .unwrap()
+                .expect("failed to deploy eth smart contract")
         }
     }
 
@@ -409,28 +426,31 @@ async fn main() {
     });
 
     let shared_state = Arc::new(lambda);
-
     let state_copy_for_batches = shared_state.clone();
 
     // this thread will periodically try to build a batch
+    tracing_subscriber::fmt()
+    .with_target(false)
+    .compact()
+    .init();
+    
     task::spawn(async move {
         loop {
-            println!("Building batch...");
+            tracing::info!("Building batch...");
             // TODO: investigate why there are no transactions when the batch is empty
             let mut state = state_copy_for_batches.lock().await;
             if !state.batch_builder.txs.is_empty() {
-                state.build_batch().await.unwrap();
+                if let Err(err) = state.build_batch().await {
+                    tracing::error!("failed to build batch - {err}")
+                }
             } else {
-                println!("Skipping batch, no transactions");
+                tracing::info!("Skipping batch, no transactions");
             }
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
 
-    // initialize tracing
-    tracing_subscriber::fmt::init();
     let cors = tower_http::cors::CorsLayer::permissive();
-
     let app = Router::new()
         // `GET /nonce` gets user nonce (see nonce function)
         .route("/nonce", post(get_nonce))
@@ -446,7 +466,7 @@ async fn main() {
         .with_state(shared_state)
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind(":::3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(":::3000").await.expect("failed to start tokio tcp listener");
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -461,7 +481,7 @@ async fn get_nonce(
     State(state): State<Arc<LambdaMutex>>,
     Json(payload): Json<NonceIdentifier>,
 ) -> (StatusCode, Json<Nonce>) {
-    println!(
+    tracing::info!(
         "Getting nonce from user {:?} to application {:?}",
         payload.user, payload.application
     );
@@ -526,14 +546,14 @@ async fn submit_transaction(
         true,
     );
 
-    println!("new transaction submitted: {:?} sig {:?}", message, sig);
+    tracing::info!("new transaction submitted: {:?} sig {:?}", message, sig);
     if let Err(e) = sig {
-        println!("declined tx: sig serialization failed");
+        tracing::error!("declined tx: sig serialization failed");
         return Err((StatusCode::EXPECTATION_FAILED, e.to_string()));
     }
 
     if let Err(e) = message {
-        println!("declined tx: message serialization failed");
+        tracing::error!("declined tx: message serialization failed");
         return Err((StatusCode::EXPECTATION_FAILED, e.to_string()));
     }
 
@@ -543,7 +563,7 @@ async fn submit_transaction(
     };
 
     if let Err(e) = signed_transaction.recover(&DOMAIN) {
-        println!("declined tx: sig recovery failed");
+        tracing::error!("declined tx: sig recovery failed");
         return Err((StatusCode::UNAUTHORIZED, e.to_string()));
     };
     // TODO: add logic to calculate wei per byte, now it is wei per gas
@@ -572,7 +592,7 @@ async fn submit_transaction(
         .wallet_state
         .verify_single(sequencer_address, &signed_transaction.to_wire_transaction());
     if transaction_opt.is_none() {
-        println!("declined tx: transaction not valid");
+        tracing::error!("declined tx: transaction not valid");
         return Err((
             StatusCode::NOT_ACCEPTABLE,
             "Transaction not valid".to_string(),
