@@ -24,17 +24,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use alloy_core::primitives::{address, U256};
+    use message::{WireTransaction, WireSignature, WireParity};
+
     use super::*;
 
     #[test]
     fn test() {
-        let j
-            = to_json_string("0x1463f9725f107358c9115bc9d86c72dd5823e9b1e60114ab7528bb862fb57e8a2bcd567a2e929a0be56a5e000a0d48656c6c6f2c20576f726c643f2076a270f52ade97cd95ef7be45e08ea956bfdaf14b7fc4f8816207fa9eb3a5c17207ccdd94ac1bd86a749b66526fff6579e2b6bf1698e831955332ad9d5ed44da7208000000000000001c").unwrap();
+        let batch = Batch{
+            sequencer_payment_address: address!("63F9725f107358c9115BC9d86c72dD5823E9B1E6"),
+            txs: vec![
+                WireTransaction {
+                    app: address!("ab7528bb862fB57E8A2BCd567a2e929a0Be56a5e"),
+                    nonce: 0,
+                    max_gas_price: 10,
+                    data: vec![72,101,108,108,111,44,32,87,111,114,108,100,63],
+                    signature: WireSignature{
+                        r: U256::default(),
+                        s: U256::default(),
+                        v: WireParity::Eip155(0x1c),
+                    },
+                },
+            ],
+        };
 
-        assert_eq!(
-            j,
-            r#"{"sequencer_payment_address":"0x63F9725f107358c9115BC9d86c72dD5823E9B1E6","txs":[{"app":"0xab7528bb862fB57E8A2BCd567a2e929a0Be56a5e","nonce":0,"max_gas_price":10,"data":[72,101,108,108,111,44,32,87,111,114,108,100,63],"signature":{"r":"0x76a270f52ade97cd95ef7be45e08ea956bfdaf14b7fc4f8816207fa9eb3a5c17","s":"0x7ccdd94ac1bd86a749b66526fff6579e2b6bf1698e831955332ad9d5ed44da72","v":"0x1c"}}]}"#
-        );
-        println!("{:?}", j);
+        let encoded = alloy_core::hex::encode(batch.to_bytes());
+        let decoded_json = to_json_string(&encoded).unwrap();
+        let decoded: Batch = serde_json::from_str(&decoded_json).unwrap();
+
+        assert_eq!(batch.sequencer_payment_address, decoded.sequencer_payment_address);
+        assert_eq!(batch.txs, decoded.txs);
     }
 }
