@@ -182,16 +182,52 @@ sol! {
     }
 }
 
+pub const PARITY_TYPE_EIP155: u32 = 0;
+pub const PARITY_TYPE_NON_EIP155: u32 = 1;
+pub const PARITY_TYPE_PARITY: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, ssz_derive::Encode, ssz_derive::Decode)]
-#[ssz(enum_behaviour = "union")]
-pub enum WireParity {
-    /// Explicit V value. May be EIP-155 modified.
-    Eip155(u64),
-    /// Non-EIP155. 27 or 28.
-    NonEip155(bool),
-    /// Parity flag. True for odd.
-    Parity(bool),
+pub struct WireParity {
+    pub parity_type: u32,
+    pub eip155_value: u64,
+    pub noneip155_value: bool,
+    pub pairty_value: bool,
+}
+
+impl WireParity {
+    pub fn from_parity(value: Parity) -> Self {
+        match value {
+            Parity::Eip155(v) => WireParity{
+                parity_type: PARITY_TYPE_EIP155,
+                eip155_value: v,
+                noneip155_value: false,
+                pairty_value: false,
+            },
+            Parity::NonEip155(v) => WireParity{
+                parity_type: PARITY_TYPE_NON_EIP155,
+                eip155_value: 0,
+                noneip155_value: v,
+                pairty_value: false,
+            },
+            Parity::Parity(v) => WireParity{
+                parity_type: PARITY_TYPE_PARITY,
+                eip155_value: 0,
+                noneip155_value: false,
+                pairty_value: v,
+            },
+        }
+    }
+
+    pub fn to_parity(&self) -> Result<Parity, Error> {
+        if self.parity_type == PARITY_TYPE_EIP155 {
+            return Ok(Parity::Eip155(self.eip155_value))
+        } else if self.parity_type == PARITY_TYPE_NON_EIP155 {
+            return Ok(Parity::NonEip155(self.noneip155_value))
+        } else if self.parity_type == PARITY_TYPE_PARITY {
+            return Ok(Parity::Parity(self.pairty_value))
+        }
+        Err(anyhow!("invalid parity type"))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, ssz_derive::Encode, ssz_derive::Decode)]
@@ -204,22 +240,14 @@ pub struct WireSignature {
 impl WireSignature {
     pub fn from_signature(value: &Signature) -> Self {
         Self {
-            v: match value.v() {
-                Parity::Eip155(v) => WireParity::Eip155(v),
-                Parity::NonEip155(v) => WireParity::NonEip155(v),
-                Parity::Parity(v) => WireParity::Parity(v),
-            },
+            v: WireParity::from_parity(value.v()),
             r: value.r(),
             s: value.s(),
         }
     }
 
     pub fn to_signature(&self) -> Signature {
-        let v = match self.v {
-            WireParity::Eip155(v) => Parity::Eip155(v),
-            WireParity::NonEip155(v) => Parity::NonEip155(v),
-            WireParity::Parity(v) => Parity::Parity(v),
-        }; 
+        let v = self.v.to_parity().unwrap();
         Signature::new(self.r, self.s, v)
     }
 }
